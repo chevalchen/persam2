@@ -16,6 +16,7 @@ warnings.filterwarnings("ignore")
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
+import hdbscan
 
 class MPASAM2:
     """
@@ -67,7 +68,7 @@ class MPASAM2:
 
         # align mask to feature resolution
         mask_low = F.interpolate(proc_mask.float(), size=(Hf, Wf), mode="bilinear", align_corners=False)
-        mask_low = (mask_low > 0.5).squeeze(1)  # [B, Hf, Wf]
+        mask_low = (mask_low > 0).squeeze(1)  # [B, Hf, Wf]
 
         # one-time extraction of foreground features per batch
         feats_perm = feats.permute(0, 2, 3, 1).detach()  # [B, Hf, Wf, C]
@@ -87,6 +88,8 @@ class MPASAM2:
 
         # derive prompt centers from dense features
         self.prompt_centers = self._compute_prompt_centers(self.dense_fg_feats, self.num_prompt_centers)
+        # hdbscan version
+        self.prompt_centers_hdb = self._compute_prompt_centers_hdb(self.dense_fg_feats, self.num_prompt_centers)
 
     def _compute_prompt_centers(self, dense_list: List[torch.Tensor], target_k: int) -> torch.Tensor:
         """
@@ -120,6 +123,74 @@ class MPASAM2:
         # stack to [B, K, C, 1, 1]
         prompt_tensor = torch.stack(centers_per_batch, dim=0)
         return prompt_tensor
+    
+    def _compute_prompt_centers_hdb(self, dense_list: List[torch.Tensor], target_k: int) -> torch.Tensor:
+        """
+        Build [B, K, C, 1, 1] tensor of centers using
+        HDBSCAN clustering. If HDBSCAN fails or finds fewer than K clusters,
+        fallback to KMeans or repeating centers.
+        """
+        centers_per_batch = []
+
+        for fg in dense_list:
+            N = fg.shape[0]
+            C = fg.shape[1]
+
+            # if fg is empty, give a global mean 0 and repeat K times
+            if N == 0:
+                center = fg.new_zeros((1, C))
+                center = F.normalize(center, p=2, dim=1)
+                centers = center.repeat(target_k, 1)
+            else:
+                data_np = fg.cpu().numpy().astype(np.float32)
+
+                hdbscan_success = False
+
+                #   HDBSCAN clustering
+                clusterer = hdbscan.HDBSCAN( 
+                    # divide by size for larger clusters
+                    min_cluster_size=15,
+                    # define how conservative the clustering should be
+                    min_samples=8,
+                    cluster_selection_method='eom'
+                )
+                labels = clusterer.fit_predict(data_np)
+                unique_clusters = [c for c in np.unique(labels) if c != -1]
+
+                if len(unique_clusters) > 0:
+                    # extract cluster centers
+                    cluster_centers = []
+                    for c in unique_clusters:
+                        pts = data_np[labels == c]
+                        if len(pts) > 0:
+                            cluster_centers.append(pts.mean(0, keepdims=True))
+                    if len(cluster_centers) > 0:
+                        centers = torch.tensor(np.concatenate(cluster_centers, axis=0),
+                                            dtype=fg.dtype, device=fg.device)
+                        hdbscan_success = True
+
+                #   fallback to KMeans
+                if not hdbscan_success:
+                    print("HDBSCAN failed, fallback to KMeans")
+                    # sklearn KMeans fallback
+                    k = max(2,6)
+                    km = KMeans(n_clusters=k, random_state=0).fit(data_np)
+                    centers = torch.tensor(km.cluster_centers_, dtype=fg.dtype, device=fg.device)
+
+                if centers.shape[0] < target_k:
+                    repeat_num = target_k - centers.shape[0]
+                    centers = torch.cat([centers, centers[:1].repeat(repeat_num, 1)], dim=0)
+                elif centers.shape[0] > target_k:
+                    centers = centers[:target_k]
+
+            # [K,C] → normalize → [K,C,1,1]
+            centers = F.normalize(centers, p=2, dim=1)
+            centers = centers.unsqueeze(-1).unsqueeze(-1)
+
+            centers_per_batch.append(centers)
+        prompt_tensor = torch.stack(centers_per_batch, dim=0) 
+
+        return  prompt_tensor  # [B,K,C,1,1]
 
     def predict(self, test_image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -132,7 +203,11 @@ class MPASAM2:
         if self.dense_fg_feats is None or self.prompt_centers is None:
             raise RuntimeError("Reference not set. Call set_reference first.")
 
+        centers_kmeans = self.prompt_centers
+        centers_hdb = self.prompt_centers_hdb
+
         self.predictor.set_image(test_image)
+
         cached_features = self.predictor._features
         orig_hw = self.predictor._orig_hw[0]  # (H, W)
         test_feat = cached_features["image_embed"]  # [B, C, Hf, Wf]
@@ -170,48 +245,52 @@ class MPASAM2:
             attn_sim_list.append(attn_sim_b)
         attn_sim = torch.cat(attn_sim_list, dim=0)
 
-        # choose auto points from prompt_centers
-        auto_point_coords, auto_point_labels = self.cal_point(cached_features, self.prompt_centers, orig_hw)
+        #   HDBSCAN prompt
+        auto_coords_h, auto_labels_h = self.cal_point(cached_features, centers_hdb, orig_hw)
 
-        self.last_points = auto_point_coords.clone()
-        self.last_labels = auto_point_labels.clone()
-
-        masks, scores, logits = self.predictor.predict(
-            point_coords=auto_point_coords,
-            point_labels=auto_point_labels,
+        masks_h, scores_h, logits_h = self.predictor.predict(
+            point_coords=auto_coords_h,
+            point_labels=auto_labels_h,
             multimask_output=True,
             attn_sim=attn_sim,
             target_embedding=self.target_embedding
         )
+        best_idx_h = int(np.argmax(scores_h))
+        best_score_h = scores_h[best_idx_h]
+
+        #   KMeans-only prompt
+        auto_coords_k, auto_labels_k = self.cal_point(cached_features, centers_kmeans, orig_hw)
+
+        masks_k, scores_k, logits_k = self.predictor.predict(
+            point_coords=auto_coords_k,
+            point_labels=auto_labels_k,
+            multimask_output=True,
+            attn_sim=attn_sim,
+            target_embedding=self.target_embedding
+        )
+        best_idx_k = int(np.argmax(scores_k))
+        best_score_k = scores_k[best_idx_k]
+
+        if best_score_h >= best_score_k:
+            # using HDBSCAN
+            self.last_points = auto_coords_h.clone()
+            self.last_labels = auto_labels_h.clone()
+            masks, scores, logits = masks_h, scores_h, logits_h
+        else:
+            # using KMeans
+            self.last_points = auto_coords_k.clone()
+            self.last_labels = auto_labels_k.clone()
+            masks, scores, logits = masks_k, scores_k, logits_k
         best_idx = int(np.argmax(scores))
         best_logits = logits[best_idx][None, ...]
 
         masks_ref1, scores_ref1, logits_ref1 = self.predictor.predict(
-            point_coords=auto_point_coords,
-            point_labels=auto_point_labels,
+            point_coords=self.last_points,
+            point_labels=self.last_labels,
             mask_input=best_logits,
             multimask_output=True,
         )
         return masks_ref1, scores_ref1, logits_ref1
-        # logits_ref1_t = torch.as_tensor(logits_ref1[0][None, ...], device=self.device)
-        # mask_bool = masks_ref1[0].astype(bool)
-        # ys, xs = np.nonzero(mask_bool)
-        # if xs.size and ys.size:
-        #     x_min, x_max, y_min, y_max = xs.min(), xs.max(), ys.min(), ys.max()
-        #     input_box = np.array([[x_min, y_min, x_max, y_max]], dtype=np.float32)
-        # else:
-        #     input_box = None
-
-        # masks_ref2, scores_ref2, logits_ref2 = self.predictor.predict(
-        #     point_coords=auto_point_coords,
-        #     point_labels=auto_point_labels,
-        #     box=input_box if input_box is not None else None,
-        #     mask_input=logits_ref1_t,
-        #     multimask_output=True,
-        # )
-
-        # return masks_ref2, scores_ref2, logits_ref2
-        # return masks, scores, logits
 
     def cal_point(self, test_features: Dict[str, torch.Tensor],
                   prompt_centers: torch.Tensor,
@@ -364,7 +443,7 @@ def main():
     parser.add_argument("--class_name", type=str, default=None)
     parser.add_argument("--ref_idx", type=str, default="00")
     parser.add_argument("--output_dir", type=str, default="./outputs")
-    parser.add_argument("--num_prompt_centers", type=int, default=3)
+    parser.add_argument("--num_prompt_centers", type=int, default=4)
     args = parser.parse_args()
 
     images_root = os.path.join(args.data_root, "Images")

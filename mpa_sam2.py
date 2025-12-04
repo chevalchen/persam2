@@ -1,16 +1,4 @@
-'''
-在persam2_ori.py的基础上，修改了自动点选模块，使其支持多峰参考特征的聚类表示。
-主要修改点包括：
-1. 在set_reference方法中，提取参考图像的特征时，使用
-KMeans对前景特征进行聚类，得到多个中心点作为视觉提示。
-2. 在predict方法中，计算测试图像与参考特征的相似度时，使用参考图像的所有前景特征进行相似度计算，并对相似度进行聚合。
-3. 修改了cal_point方法，使其能够处理多个视觉提示，并为每个提示选择一个正点，同时选择一个全局负点。
-说明（关键代码修改点）
-target_feat 改为 list，每个元素是参考前景所有像素的 normalized feature [N, C]。在 predict() 中用矩阵乘法得到 [N, Hf*Wf]，再对 N 做 mean（或可改为 max）来保持多峰响应。此处保留 mean，稳定且能覆盖多个部件。
-target_embedding 仍保留 [B,1,C]（mean），以兼容 predictor.predict(..., target_embedding=...) 的 API。
-visual_prompt 改为多中心 [B, K, C, 1, 1]，使用 KMeans 在前景像素上生成 1~4 个中心（按前景像素数量自适应），并在 cal_point() 中对每个中心取 argmax 产生多个正点。
-修复了 prompt/reshape 的错误取法与 torch.bmm 传入 list 导致的异常。
-''' 
+#!/usr/bin/env python3
 import os
 import glob
 import argparse
@@ -23,112 +11,156 @@ import torch.nn.functional as F
 from sklearn.cluster import KMeans
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-class AutomaticPointor:
-    def __init__(self, sam2_checkpoint: str, sam2_cfg: str, device: Optional[str] = None):
+class MPASAM2:
+    """
+    Mutil-Peak Autopointer for SAM2:
+    - single extraction of foreground features from reference
+    - produce: dense_fg_feats (list of [N,C]), prompt_centers [B,K,C,1,1], mean target_embedding [B,1,C]
+    - similarity computed from dense_fg_feats -> multi-peak maps
+    - cal_point uses prompt_centers to select K positive points + 1 negative
+    """
+
+    def __init__(self, sam2_checkpoint: str, sam2_cfg: str, device: Optional[str] = None,
+                 num_prompt_centers: int = 3):
         self.model = build_sam2(sam2_cfg, sam2_checkpoint)
         self.predictor = SAM2ImagePredictor(self.model)
         self.device = device or self.model.device
         self.model.eval()
-        # --- modified: store visual_prompt and target_feat differently to keep multi-peak info
-        self.visual_prompt: Optional[torch.Tensor] = None        # [B, K, C, 1, 1]
-        self.ref_feats_for_clustering: Optional[torch.Tensor] = None
-        self.ref_mask_for_clustering: Optional[torch.Tensor] = None
-        self.num_prompt_clusters = 1
-        self.cluster_agg_method = "mean"
+
+        # Derived from reference:
+        self.dense_fg_feats: Optional[List[torch.Tensor]] = None  # list[B] of [N, C]
+        self.prompt_centers: Optional[torch.Tensor] = None        # [B, K, C, 1, 1]
+        self.target_embedding: Optional[torch.Tensor] = None     # [B,1,C]
+
+        self.num_prompt_centers = max(1, int(num_prompt_centers))
+
+        # last chosen points for visualization
         self.last_points: Optional[torch.Tensor] = None
         self.last_labels: Optional[torch.Tensor] = None
-        # target_embedding: keep [B,1,C] for predictor API; target_feat: list per batch of dense [N, C] for sim
-        self.target_embedding : Optional[torch.Tensor] = None   # [B,1,C]
-        self.target_feat : Optional[List[torch.Tensor]] = None  # list of length B, each [N, C]
 
     def set_reference(self, ref_image: np.ndarray, ref_mask: np.ndarray) -> None:
+        """
+        Extract foreground features once, then derive:
+          - dense_fg_feats: list of [N, C] (normalized)
+          - prompt_centers: [B, K, C, 1, 1]
+          - target_embedding: [B,1,C] (mean of fg_feats)
+        """
         self.predictor.set_image(ref_image)
         ref_features = self.predictor._features
-        mask = torch.as_tensor(ref_mask, dtype=torch.float, device=self.device)
+        mask = torch.as_tensor(ref_mask, dtype=torch.float32, device=self.device)
         if mask.ndim == 2:
             mask = mask.unsqueeze(0)
         if mask.ndim == 3:
             mask = mask.unsqueeze(1)
-        processed_mask = self.predictor._transforms.transform_masks(mask)
+        proc_mask = self.predictor._transforms.transform_masks(mask)
 
         feats = ref_features["image_embed"]
         if feats.dim() == 3:
-            feats = feats.unsqueeze(0)
-        Bf, C, Hf, Wf = feats.shape
-        # --- modified: keep ref_feats_for_clustering for later cluster sampling
-        self.ref_feats_for_clustering = feats.permute(0, 2, 3, 1).detach()  # [B, Hf, Wf, C]
-        mask_feat = F.interpolate(processed_mask.float(), size=(Hf, Wf), mode="bilinear", align_corners=False)
-        self.ref_mask_for_clustering = (mask_feat > 0.5).squeeze(1).bool().detach()  # [B, Hf, Wf]
-        b, hf, wf, c = self.ref_feats_for_clustering.shape
+            feats = feats.unsqueeze(0)  # [B, C, Hf, Wf]
+        B, C, Hf, Wf = feats.shape
 
-        # --- modified: build dense per-pixel target_feat list and mean target_embedding
-        dense_embeddings = []
-        mean_embeddings = []
-        for i in range(b):
-            feat_b = self.ref_feats_for_clustering[i]  # [Hf, Wf, C]
-            mask_b = self.ref_mask_for_clustering[i]  # [Hf, Wf]
-            target_feat_pixels = feat_b[mask_b]       # [N, C]
-            if target_feat_pixels.shape[0] == 0:
-                # fallback: use all pixels
-                target_feat_pixels = feat_b.reshape(-1, c)
+        # align mask to feature resolution
+        mask_low = F.interpolate(proc_mask.float(), size=(Hf, Wf), mode="bilinear", align_corners=False)
+        mask_low = (mask_low > 0).squeeze(1)  # [B, Hf, Wf]
 
-            # normalize per-vector and keep dense list (N, C)
-            target_feat_pixels = F.normalize(target_feat_pixels, p=2, dim=1).detach()
-            dense_embeddings.append(target_feat_pixels)
+        # one-time extraction of foreground features per batch
+        feats_perm = feats.permute(0, 2, 3, 1).detach()  # [B, Hf, Wf, C]
+        dense_list = []
+        means = []
+        for b in range(B):
+            fg = feats_perm[b][mask_low[b]]  # [N, C] (may be 0)
+            if fg.numel() == 0:
+                # fallback to global mean over full feature map
+                fg = feats_perm[b].reshape(-1, C)
+            fg = F.normalize(fg, p=2, dim=1).to(self.device)  # normalize vectors
+            dense_list.append(fg)
+            means.append(fg.mean(0, keepdim=True))  # [1, C]
 
-            # keep mean for predictor API but do not use it for sim aggregation directly
-            mean_emb = target_feat_pixels.mean(0, keepdim=True)  # [1, C]
-            mean_embeddings.append(mean_emb)
+        self.dense_fg_feats = dense_list
+        self.target_embedding = torch.cat(means, dim=0).unsqueeze(1).to(self.device)  # [B,1,C]
 
-        # store
-        self.target_feat = dense_embeddings                     # list of [N, C]
-        self.target_embedding = torch.cat(mean_embeddings, dim=0).unsqueeze(1).to(self.device)  # [B,1,C]
+        # derive prompt centers from dense features
+        self.prompt_centers = self._compute_prompt_centers(self.dense_fg_feats, self.num_prompt_centers)
 
-        # --- modified: extract visual_prompt as multi-centroid prompts [B, K, C, 1, 1]
-        self.visual_prompt = self.extract_visual_prompt(ref_features, processed_mask)
+    def _compute_prompt_centers(self, dense_list: List[torch.Tensor], target_k: int) -> torch.Tensor:
+        """
+        Build [B, K, C, 1, 1] tensor of centers.
+        If a batch item has fewer points than K, fallback to repeating the mean.
+        """
+        centers_per_batch = []
+        for fg in dense_list:
+            N = fg.shape[0]
+            if N == 0:
+                # fallback: zero center
+                center = fg.new_zeros((1, fg.shape[1]))
+                center = F.normalize(center, p=2, dim=1)
+                centers = center
+            elif N < target_k:
+                mean = fg.mean(0, keepdim=True)
+                centers = mean.repeat(target_k, 1)
+            else:
+                # run KMeans on CPU
+                k = max(1, min(target_k, N))
+                # sklearn requires numpy float64 or float32. Use float32
+                km = KMeans(n_clusters=k, random_state=0).fit(fg.cpu().numpy())
+                centers = torch.tensor(km.cluster_centers_, dtype=fg.dtype, device=fg.device)
+                if k < target_k:
+                    # pad by repeating first center
+                    pad = centers[0:1].repeat(target_k - k, 1)
+                    centers = torch.cat([centers, pad], dim=0)
+            centers = F.normalize(centers, p=2, dim=1)  # [K, C]
+            centers = centers.unsqueeze(-1).unsqueeze(-1)  # [K, C, 1, 1]
+            centers_per_batch.append(centers)
+        # stack to [B, K, C, 1, 1]
+        prompt_tensor = torch.stack(centers_per_batch, dim=0)
+        return prompt_tensor
 
     def predict(self, test_image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self.visual_prompt is None or self.target_feat is None:
-            raise ValueError("Reference not set. Call set_reference() first.")
+        """
+        Main inference:
+         - compute multi-peak similarity from dense_fg_feats
+         - build attn_sim from aggregated sim
+         - auto select points from prompt_centers
+         - call predictor.predict with multimask_output
+        """
+        if self.dense_fg_feats is None or self.prompt_centers is None:
+            raise RuntimeError("Reference not set. Call set_reference first.")
+
         self.predictor.set_image(test_image)
         cached_features = self.predictor._features
-        orig_hw = self.predictor._orig_hw[0]
-        test_feat_embed = cached_features["image_embed"] # [B, C, Hf, Wf]
-        b, c, hf, wf = test_feat_embed.shape
+        orig_hw = self.predictor._orig_hw[0]  # (H, W)
+        test_feat = cached_features["image_embed"]  # [B, C, Hf, Wf]
+        B, C, Hf, Wf = test_feat.shape
 
-        # normalize test features for cosine similarity
-        norm_test_feat = F.normalize(test_feat_embed, p=2, dim=1)  # [B, C, Hf, Wf]
-        norm_test_feat_flat = norm_test_feat.view(b, c, hf * wf)   # [B, C, Hf*Wf]
+        # normalize test features
+        test_norm = F.normalize(test_feat, p=2, dim=1)  # [B, C, Hf, Wf]
+        test_flat = test_norm.view(B, C, Hf * Wf)       # [B, C, Hf*Wf]
 
-        # --- modified: compute similarity using dense reference features (list) and aggregate across ref pixels
-        sim_list = []
-        for bi in range(b):
-            ref_dense = self.target_feat[bi]          # [N, C]
-            test_b_flat = norm_test_feat_flat[bi]    # [C, Hf*Wf]
-            # matmul: [N, C] x [C, Hf*Wf] -> [N, Hf*Wf]
-            sim_dense = torch.matmul(ref_dense, test_b_flat)      # [N, Hf*Wf]
-            # aggregate over N (ref pixels): mean (keeps multi-peak behavior)
-            sim_agg = sim_dense.mean(0)                           # [Hf*Wf]
-            sim_agg = sim_agg.view(1, 1, hf, wf)                  # [1,1,Hf,Wf]
-            sim_list.append(sim_agg)
-        sim = torch.cat(sim_list, dim=0)  # [B,1,Hf,Wf]
+        # similarity aggregated from dense reference pixels (mean over ref pixels)
+        sim_maps = []
+        for b in range(B):
+            ref = self.dense_fg_feats[b]                 # [N, C]
+            # [N, C] @ [C, Hf*Wf] -> [N, Hf*Wf]
+            sim_dense = torch.matmul(ref, test_flat[b])  # [N, Hf*Wf]
+            sim_agg = sim_dense.mean(0)                  # [Hf*Wf]
+            sim_agg = sim_agg.view(1, 1, Hf, Wf)         # [1,1,Hf,Wf]
+            sim_maps.append(sim_agg)
+        sim = torch.cat(sim_maps, dim=0)  # [B,1,Hf,Wf]
 
-        # upsample and postprocess to image size
-        sim_up = self.predictor._transforms.postprocess_masks(
-            sim,
-            orig_hw=orig_hw,
-        )  # [B,1,H,W]
-
+        # postprocess to original size
+        sim_up = self.predictor._transforms.postprocess_masks(sim, orig_hw=orig_hw)  # [B,1,H,W]
         sim_orig = sim_up.squeeze(1)  # [B, H, W]
 
-        # build attn_sim similar to original (used for attention guidance)
+        # attn_sim for predictor guidance (64x64 flattened)
         attn_sim_list = []
-        for i in range(b):
-            sim_b = sim_orig[i] # [orig_h, orig_w]
+        for b in range(B):
+            sim_b = sim_orig[b]
             sim_std = torch.std(sim_b)
             if sim_std == 0:
                 sim_std = 1.0
@@ -136,25 +168,21 @@ class AutomaticPointor:
             sim_b_64 = F.interpolate(sim_b.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="bilinear")
             attn_sim_b = sim_b_64.sigmoid_().unsqueeze(0).flatten(3)
             attn_sim_list.append(attn_sim_b)
-        attn_sim = torch.cat(attn_sim_list, dim=0)  # [B, 1, 4096] or similar
+        attn_sim = torch.cat(attn_sim_list, dim=0)
 
-        # auto point coords / labels using cal_point (cal_point uses visual_prompt multi-centroids)
-        auto_point_coords, auto_point_labels = self.cal_point(
-            cached_features, self.visual_prompt, orig_hw
-        )
+        # choose auto points from prompt_centers
+        auto_point_coords, auto_point_labels = self.cal_point(cached_features, self.prompt_centers, orig_hw)
 
         self.last_points = auto_point_coords.clone()
         self.last_labels = auto_point_labels.clone()
 
-        # call predictor with multimodal guidance
         masks, scores, logits = self.predictor.predict(
             point_coords=auto_point_coords,
             point_labels=auto_point_labels,
             multimask_output=True,
             attn_sim=attn_sim,
-            target_embedding=self.target_embedding  # keep mean for predictor
+            target_embedding=self.target_embedding
         )
-
         best_idx = int(np.argmax(scores))
         best_logits = logits[best_idx][None, ...]
 
@@ -164,149 +192,91 @@ class AutomaticPointor:
             mask_input=best_logits,
             multimask_output=True,
         )
+        return masks_ref1, scores_ref1, logits_ref1
+        # logits_ref1_t = torch.as_tensor(logits_ref1[0][None, ...], device=self.device)
+        # mask_bool = masks_ref1[0].astype(bool)
+        # ys, xs = np.nonzero(mask_bool)
+        # if xs.size and ys.size:
+        #     x_min, x_max, y_min, y_max = xs.min(), xs.max(), ys.min(), ys.max()
+        #     input_box = np.array([[x_min, y_min, x_max, y_max]], dtype=np.float32)
+        # else:
+        #     input_box = None
 
-        logits_ref1_t = torch.as_tensor(logits_ref1[0][None, ...], device=self.device)
+        # masks_ref2, scores_ref2, logits_ref2 = self.predictor.predict(
+        #     point_coords=auto_point_coords,
+        #     point_labels=auto_point_labels,
+        #     box=input_box if input_box is not None else None,
+        #     mask_input=logits_ref1_t,
+        #     multimask_output=True,
+        # )
 
-        mask_bool = masks_ref1[0].astype(bool)
-        ys, xs = np.nonzero(mask_bool)
-        if xs.size and ys.size:
-            x_min, x_max, y_min, y_max = xs.min(), xs.max(), ys.min(), ys.max()
-            input_box = np.array([[x_min, y_min, x_max, y_max]], dtype=np.float32)
-        else:
-            input_box = None
-
-        masks_ref2, scores_ref2, logits_ref2 = self.predictor.predict(
-            point_coords=auto_point_coords,
-            point_labels=auto_point_labels,
-            box=input_box if input_box is not None else None,
-            mask_input=logits_ref1_t,
-            multimask_output=True,
-        )
-
-        return masks_ref2, scores_ref2, logits_ref2
-
-    def extract_visual_prompt(self, ref_features: Dict[str, torch.Tensor], ref_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Modified: return multi-centroid visual prompts of shape [B, K, C, 1, 1]
-        Each centroid represents a mode (component) in the reference foreground.
-        """
-        features = ref_features["image_embed"]
-        if features.dim() == 3:
-            features = features.unsqueeze(0)
-        B, C, Hf, Wf = features.shape
-
-        mask = F.interpolate(ref_mask.float(), size=(Hf, Wf), mode="bilinear", align_corners=False)
-        if mask.dim() == 3:
-            mask = mask.unsqueeze(1)
-        mask = (mask > 0.5).float().squeeze(1)  # [B, Hf, Wf]
-
-        prompts_per_batch = []
-        for i in range(B):
-            feat = features[i].permute(1, 2, 0)  # [Hf, Wf, C]
-            fg_feat = feat[mask[i].bool()]       # [N, C]
-            if fg_feat.shape[0] == 0:
-                # fallback to global mean
-                center = features[i].view(C, -1).mean(1, keepdim=True).T  # [1, C]
-                centers = center
-            else:
-                # number of centers adaptive to foreground size, clamp in [1,4]
-                n_centers = int(min(max(1, fg_feat.shape[0] // 200), 4))
-                if n_centers <= 1:
-                    centers = fg_feat.mean(0, keepdim=True)  # [1, C]
-                else:
-                    kmeans = KMeans(n_clusters=n_centers, random_state=0).fit(
-                        fg_feat.cpu().numpy()
-                    )
-                    centers = torch.tensor(kmeans.cluster_centers_, dtype=features.dtype, device=features.device)  # [K, C]
-
-            centers = F.normalize(centers, p=2, dim=1)    # [K, C]
-            centers = centers.unsqueeze(-1).unsqueeze(-1)  # [K, C, 1, 1]
-            prompts_per_batch.append(centers)
-
-        # pad clusters to same K per batch if needed (choose max K)
-        max_k = max([p.shape[0] for p in prompts_per_batch])
-        padded_prompts = []
-        for p in prompts_per_batch:
-            k = p.shape[0]
-            if k < max_k:
-                # pad by repeating first center
-                pad = p[0:1].repeat(max_k - k, 1, 1, 1)
-                p = torch.cat([p, pad], dim=0)
-            padded_prompts.append(p)
-        prompt_tensor = torch.stack(padded_prompts, dim=0)  # [B, K, C, 1, 1]
-        return prompt_tensor
+        # return masks_ref2, scores_ref2, logits_ref2
+        # return masks, scores, logits
 
     def cal_point(self, test_features: Dict[str, torch.Tensor],
-                  visual_prompt: torch.Tensor,
-                  original_image_size: Tuple[int, int]):
+                  prompt_centers: torch.Tensor,
+                  original_image_size: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Modified cal_point to accept visual_prompt [B, K, C, 1, 1]
-        and compute per-cluster argmax to produce multiple positive points and one negative.
+        Select points:
+         - for each cluster center (K) pick argmax location in the test feature map
+         - add one negative point by argmin on aggregated sim (or choose far-away)
+        Returns:
+         - coords: [B, K+1, 2] float tensor (x, y)
+         - labels: [B, K+1] long tensor (1 for positives, 0 for negative)
         """
         device = test_features["image_embed"].device
         B, C, Hf, Wf = test_features["image_embed"].shape
         orig_h, orig_w = original_image_size
 
         test_feat = F.normalize(test_features["image_embed"], p=2, dim=1)  # [B, C, Hf, Wf]
+        # compute per-cluster similarity maps at feature resolution
+        prompt = prompt_centers.to(device)  # [B, K, C, 1, 1]
+        K = prompt.shape[1]
 
-        # visual_prompt expected [B, K, C, 1, 1]
-        prompt_multi = visual_prompt.to(device)  # [B, K, C, 1, 1]
-        num_clusters = prompt_multi.shape[1]
-
-        # compute similarity maps for each cluster centroid
-        sim_list = []
-        for k in range(num_clusters):
-            p = prompt_multi[:, k]            # [B, C, 1, 1]
+        sim_map_list = []
+        for k in range(K):
+            p = prompt[:, k]  # [B, C, 1, 1]
             sim = F.cosine_similarity(test_feat, p, dim=1)  # [B, Hf, Wf]
-            sim_list.append(sim.unsqueeze(1))
-        sim_map = torch.cat(sim_list, dim=1)  # [B, K, Hf, Wf]
+            sim_map_list.append(sim.unsqueeze(1))
+        sim_map = torch.cat(sim_map_list, dim=1)  # [B, K, Hf, Wf]
 
-        # aggregate across clusters for a global map used for negative selection (mean or max)
-        if getattr(self, "cluster_agg_method", "mean") == "max":
-            sim_agg = sim_map.max(dim=1)[0]  # [B, Hf, Wf]
-        else:
-            sim_agg = sim_map.mean(dim=1)    # [B, Hf, Wf]
+        # aggregated map for negative selection
+        sim_agg = sim_map.mean(dim=1)  # [B, Hf, Wf]
 
-        # upsample maps to original image resolution
+        # upsample to image resolution
         sim_up_multi = F.interpolate(sim_map, size=(orig_h, orig_w), mode="bilinear", align_corners=False)  # [B, K, H, W]
         sim_up_agg = F.interpolate(sim_agg.unsqueeze(1), size=(orig_h, orig_w), mode="bilinear", align_corners=False).squeeze(1)  # [B, H, W]
 
-        auto_coords = []
-        auto_labels = []
-
-        for b_idx in range(B):
-            h, w = sim_up_agg[b_idx].shape
-            batch_coords = []
-            batch_labels = []
-
-            # for each cluster pick the highest response location (positive)
+        coords_batch = []
+        labels_batch = []
+        for b in range(B):
+            h, w = sim_up_agg[b].shape
+            coords = []
+            labels = []
             for k in range(sim_up_multi.shape[1]):
-                sim_k = sim_up_multi[b_idx, k]
+                sim_k = sim_up_multi[b, k]
                 flat_k = sim_k.flatten()
                 pos_idx = torch.argmax(flat_k)
                 pos_y, pos_x = divmod(int(pos_idx.item()), w)
                 pos_x = float(max(0, min(w - 1, pos_x)))
                 pos_y = float(max(0, min(h - 1, pos_y)))
-                batch_coords.append([pos_x, pos_y])
-                batch_labels.append(1)
-
-            # pick global negative (argmin on aggregated map)
-            flat_g = sim_up_agg[b_idx].flatten()
+                coords.append([pos_x, pos_y])
+                labels.append(1)
+            # negative: global min on aggregated map
+            flat_g = sim_up_agg[b].flatten()
             neg_idx = torch.argmin(flat_g)
             ny = int(neg_idx // w)
             nx = int(neg_idx % w)
             neg_x = float(max(0, min(w - 1, nx)))
             neg_y = float(max(0, min(h - 1, ny)))
-            batch_coords.append([neg_x, neg_y])
-            batch_labels.append(0)
+            coords.append([neg_x, neg_y])
+            labels.append(0)
 
-            coords = torch.tensor(batch_coords, device=device, dtype=torch.float32).unsqueeze(0)
-            labels = torch.tensor(batch_labels, device=device, dtype=torch.long).unsqueeze(0)
-            auto_coords.append(coords)
-            auto_labels.append(labels)
+            coords_batch.append(torch.tensor(coords, device=device, dtype=torch.float32).unsqueeze(0))  # [1, K+1, 2]
+            labels_batch.append(torch.tensor(labels, device=device, dtype=torch.long).unsqueeze(0))     # [1, K+1]
 
-        auto_point_coords = torch.cat(auto_coords, dim=0)
-        auto_point_labels = torch.cat(auto_labels, dim=0)
+        auto_point_coords = torch.cat(coords_batch, dim=0)  # [B, K+1, 2]
+        auto_point_labels = torch.cat(labels_batch, dim=0)  # [B, K+1]
 
         return auto_point_coords, auto_point_labels
 
@@ -316,10 +286,10 @@ class AutomaticPointor:
                  output_path: str,
                  pos_icon_path: str = "icon/click3.png",
                  neg_icon_path: str = "icon/click4.png"):
-
         if self.last_points is None or self.last_labels is None:
-            print(f"Warning: 'predict()' must be called before 'save_vis()'. Skipping visualization for {output_path}")
+            print(f"Warning: 'predict()' must be called before 'save_vis()'. Skipping {output_path}")
             return
+
         overlay_img = image.copy()
         alpha = 0.5
         overlay_img[mask > 0] = (alpha * np.array([0, 255, 0]) + (1 - alpha) * overlay_img[mask > 0])
@@ -370,38 +340,31 @@ class AutomaticPointor:
         plt.savefig(output_path, bbox_inches="tight", pad_inches=0)
         plt.close()
 
-def inference(auto_pointer: AutomaticPointor,
+
+def inference(ptr: MPASAM2,
               test_image: np.ndarray,
-              vis_output_path: str = None,
-              mask_output_path: str = None
-              ):
-    masks, scores, logits = auto_pointer.predict(test_image)
+              vis_output_path: Optional[str] = None,
+              mask_output_path: Optional[str] = None):
+    masks, scores, logits = ptr.predict(test_image)
     best_idx = int(np.argmax(scores))
     final_mask = masks[best_idx]
-    # sav vis
     if vis_output_path:
-        auto_pointer.save_vis(
-            image=test_image,
-            mask=final_mask,
-            output_path=vis_output_path
-        )
-
+        ptr.save_vis(test_image, final_mask, vis_output_path)
     if mask_output_path:
         masks_uint8 = (final_mask * 255).astype(np.uint8)
         cv2.imwrite(mask_output_path, masks_uint8)
-
     return masks, scores
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run PerSAM2 Fine-tuning on PerSeg dataset structure.")
-    parser.add_argument("--sam2_checkpoint", type=str, default="checkpoints/sam2.1_hiera_large.pt", help="Path to SAM2 checkpoint.")
-    parser.add_argument("--model_cfg", type=str, default="configs/sam2.1/sam2.1_hiera_l.yaml", help="SAM2 config.")
-    parser.add_argument("--data_root", type=str, default="./data", help="Root containing Images/ and Annotations/ folders.")
-    parser.add_argument("--class_name", type=str, default=None, help="Specific class to run. If None, runs all found classes.")
-    parser.add_argument("--ref_idx", type=str, default="00", help="Index of reference image (e.g., '00').")
-    parser.add_argument("--output_dir", type=str, default="./outputs", help="Where to save results.")
-    parser.add_argument("--num_prompt_clusters", type=int, default=1,help="cluster on reference-level")
 
+def main():
+    parser = argparse.ArgumentParser(description="PerSAM2 - cleaned minimal implementation")
+    parser.add_argument("--sam2_checkpoint", type=str, required=True)
+    parser.add_argument("--model_cfg", type=str, required=True)
+    parser.add_argument("--data_root", type=str, default="./data")
+    parser.add_argument("--class_name", type=str, default=None)
+    parser.add_argument("--ref_idx", type=str, default="00")
+    parser.add_argument("--output_dir", type=str, default="./outputs")
+    parser.add_argument("--num_prompt_centers", type=int, default=4)
     args = parser.parse_args()
 
     images_root = os.path.join(args.data_root, "Images")
@@ -409,53 +372,42 @@ if __name__ == "__main__":
         classes = [args.class_name]
     else:
         classes = sorted([d for d in os.listdir(images_root) if os.path.isdir(os.path.join(images_root, d))])
-        print(f"======> Automatically found {len(classes)} classes: {classes}")
 
-    for class_idx, class_name in enumerate(classes):
-        print(f"\n\n[{class_idx+1}/{len(classes)}] Processing Class: ===> {class_name} <===")
+    os.makedirs(args.output_dir, exist_ok=True)
 
-        img_dir = os.path.join(args.data_root, "Images", class_name)
+    for class_name in classes:
+        img_dir = os.path.join(images_root, class_name)
         mask_dir = os.path.join(args.data_root, "Annotations", class_name)
-        ref_img_name = f"{args.ref_idx}.jpg"
-        ref_mask_name = f"{args.ref_idx}.png"
-        ref_img_path = os.path.join(img_dir, ref_img_name)
-        ref_mask_path = os.path.join(mask_dir, ref_mask_name)
-
+        ref_img_path = os.path.join(img_dir, f"{args.ref_idx}.jpg")
+        ref_mask_path = os.path.join(mask_dir, f"{args.ref_idx}.png")
         if not os.path.exists(ref_img_path) or not os.path.exists(ref_mask_path):
-            print(f"Skipping {class_name}: Reference files not found ({ref_img_name}/{ref_mask_name})")
+            print(f"Skipping {class_name}: reference missing")
             continue
 
-        print(f"--> Initializing SAM2 for {class_name}...")
-        persam = AutomaticPointor(args.sam2_checkpoint, args.model_cfg)
+        ptr = MPASAM2(args.sam2_checkpoint, args.model_cfg,
+                             num_prompt_centers=args.num_prompt_centers)
 
-        print(f"--> Loading reference: {os.path.join(class_name, ref_img_name)}")
         ref_img = cv2.cvtColor(cv2.imread(ref_img_path), cv2.COLOR_BGR2RGB)
         ref_mask = cv2.imread(ref_mask_path, cv2.IMREAD_GRAYSCALE)
 
-        print(f"--> Setting reference (One-shot)...")
-        persam.set_reference(ref_img, ref_mask)
+        ptr.set_reference(ref_img, ref_mask)
 
-        output_class_dir = os.path.join(args.output_dir, class_name)
-        os.makedirs(output_class_dir, exist_ok=True)
+        out_class_dir = os.path.join(args.output_dir, class_name)
+        os.makedirs(out_class_dir, exist_ok=True)
 
         test_images = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))
-        print(f"--> Found {len(test_images)} images. Starting inference for {class_name}...")
-
-        for test_path in tqdm(test_images, desc=f"Inference ({class_name})"):
+        for test_path in tqdm(test_images, desc=f"Infer {class_name}"):
             img_name = os.path.basename(test_path)
-            if img_name == ref_img_name: continue
-
+            if img_name == f"{args.ref_idx}.jpg":
+                continue
             test_img = cv2.cvtColor(cv2.imread(test_path), cv2.COLOR_BGR2RGB)
+            base = os.path.splitext(img_name)[0]
+            vis_path = os.path.join(out_class_dir, base + "_vis.jpg")
+            mask_path = os.path.join(out_class_dir, base + ".png")
+            inference(ptr, test_img, vis_output_path=vis_path, mask_output_path=mask_path)
 
-            base_name = os.path.splitext(img_name)[0]
-            vis_path = os.path.join(output_class_dir, base_name + "_vis.jpg")
-            mask_path = os.path.join(output_class_dir, base_name + ".png")
+    print("Done.")
 
-            inference(
-                persam,
-                test_img,
-                vis_output_path=vis_path,
-                mask_output_path=mask_path
-            )
 
-    print("\n======> All classes processed.")
+if __name__ == "__main__":
+    main()
