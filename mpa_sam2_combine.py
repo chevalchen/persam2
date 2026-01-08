@@ -290,6 +290,7 @@ class MPASAM2:
             mask_input=best_logits,
             multimask_output=True,
         )
+
         return masks_ref1, scores_ref1, logits_ref1
 
     def cal_point(self, test_features: Dict[str, torch.Tensor],
@@ -360,64 +361,52 @@ class MPASAM2:
         return auto_point_coords, auto_point_labels
 
     def save_vis(self,
-                 image: np.ndarray,
-                 mask: np.ndarray,
-                 output_path: str,
-                 pos_icon_path: str = "icon/click3.png",
-                 neg_icon_path: str = "icon/click4.png"):
+                    image: np.ndarray,
+                    mask: np.ndarray,
+                    output_path: str,
+                    pos_icon_path: str = "icon/click3.png",
+                    neg_icon_path: str = "icon/click4.png"):
         if self.last_points is None or self.last_labels is None:
-            print(f"Warning: 'predict()' must be called before 'save_vis()'. Skipping {output_path}")
             return
 
-        overlay_img = image.copy()
+        import matplotlib.pyplot as plt
+        from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+
+        H, W = image.shape[:2]
         alpha = 0.5
-        overlay_img[mask > 0] = (alpha * np.array([0, 255, 0]) + (1 - alpha) * overlay_img[mask > 0])
+        overlay = image.copy().astype(float)
+        overlay[mask > 0] = (
+            alpha * np.array([0, 255, 0]) + (1 - alpha) * overlay[mask > 0]
+        )
 
-        pos_icon = cv2.imread(pos_icon_path, cv2.IMREAD_UNCHANGED) if os.path.exists(pos_icon_path) else None
-        neg_icon = cv2.imread(neg_icon_path, cv2.IMREAD_UNCHANGED) if os.path.exists(neg_icon_path) else None
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.imshow(overlay.astype(np.uint8))
+        ax.set_xlim([0, W])
+        ax.set_ylim([H, 0])
+        ax.axis("off")
 
-        overlay = overlay_img.copy()
+        pos_icon = plt.imread(pos_icon_path) if os.path.exists(pos_icon_path) else None
+        neg_icon = plt.imread(neg_icon_path) if os.path.exists(neg_icon_path) else None
+
         points = self.last_points[0]
         labels = self.last_labels[0]
 
         for i in range(points.shape[0]):
-            x = int(points[i, 0].item())
-            y = int(points[i, 1].item())
+            x = float(points[i, 0].item())
+            y = float(points[i, 1].item())
             label = labels[i].item()
-            icon_to_draw = pos_icon if label == 1 else neg_icon
-            if icon_to_draw is None:
+            icon_img = pos_icon if label == 1 else neg_icon
+            if icon_img is None:
                 continue
+            # dynamic zoom to keep icon proportional across varying image sizes
+            base_ratio = 0.01  # icon covers ~5% of image height
+            icon_scale = base_ratio * (H / icon_img.shape[0])
+            icon_box = OffsetImage(icon_img, zoom=icon_scale)
+            ab = AnnotationBbox(icon_box, (x, y), frameon=False)
+            ax.add_artist(ab)
 
-            new_size = (64, 64)
-            icon_to_draw = cv2.resize(icon_to_draw, new_size, interpolation=cv2.INTER_AREA)
-
-            ih, iw = icon_to_draw.shape[:2]
-            y1 = max(0, y - ih // 2)
-            y2 = min(image.shape[0], y + (ih - ih // 2))
-            x1 = max(0, x - iw // 2)
-            x2 = min(image.shape[1], x + (iw - iw // 2))
-
-            icon_y1 = (ih // 2) - (y - y1)
-            icon_y2 = (ih // 2) + (y2 - y)
-            icon_x1 = (iw // 2) - (x - x1)
-            icon_x2 = (iw // 2) + (x2 - x)
-
-            icon_resized = icon_to_draw[icon_y1:icon_y2, icon_x1:icon_x2]
-
-            if icon_resized.shape[2] == 4:
-                alpha_icon = icon_resized[:, :, 3] / 255.0
-                for c in range(3):
-                    overlay[y1:y2, x1:x2, c] = (
-                        alpha_icon * icon_resized[:, :, c] + (1 - alpha_icon) * overlay[y1:y2, x1:x2, c]
-                    )
-            else:
-                overlay[y1:y2, x1:x2] = icon_resized[:, :, :3]
-
-        plt.figure(figsize=(8, 8))
-        plt.imshow(overlay.astype(np.uint8))
-        plt.axis("off")
-        plt.savefig(output_path, bbox_inches="tight", pad_inches=0)
-        plt.close()
+        plt.savefig(output_path, dpi=150, bbox_inches="tight", pad_inches=0)
+        plt.close(fig)
 
 
 def inference(ptr: MPASAM2,

@@ -83,36 +83,6 @@ def evaluate_class(class_name, gt_class_dir, pred_class_dir):
 
     return np.mean(ious) * 100, np.mean(bious) * 100
 
-def evaluate_and_return(gt_root, pred_root):
-    classes = sorted([d for d in os.listdir(pred_root)
-                      if os.path.isdir(os.path.join(pred_root, d))])
-
-    results = {}
-    all_miou, all_biou = [], []
-
-    for class_name in classes:
-        gt_dir = os.path.join(gt_root, class_name)
-        pred_dir = os.path.join(pred_root, class_name)
-        if not os.path.exists(gt_dir):
-            continue
-
-        miou, biou = evaluate_class(class_name, gt_dir, pred_dir)
-        results[class_name] = (miou, biou)
-        all_miou.append(miou)
-        all_biou.append(biou)
-
-    return results, np.mean(all_miou), np.mean(all_biou)
-
-def save_results_txt(results, final_miou, final_biou, save_path):
-    with open(save_path, "w") as f:
-        f.write("Class\tmIoU(%)\tbIoU(%)\n")
-        for cls, (miou, biou) in results.items():
-            f.write(f"{cls}\t{miou:.2f}\t{biou:.2f}\n")
-        f.write("\n")
-        f.write(f"Mean mIoU: {final_miou:.2f}%\n")
-        f.write(f"Mean bIoU: {final_biou:.2f}%\n")
-
-
 def main():
     args = get_arguments()
 
@@ -155,7 +125,6 @@ def main():
     print("\n====== Final Averages ======")
     print(f"Mean IoU (mIoU): {final_miou:.2f}%")
     print(f"Boundary IoU (bIoU): {final_biou:.2f}%")
-    
 
 if __name__ == '__main__':
     main()

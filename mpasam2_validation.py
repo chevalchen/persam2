@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 import os
-import glob
 import argparse
-import pickle
 from typing import Dict, Optional, Tuple, List
 
 import cv2
@@ -11,36 +9,29 @@ import torch
 import torch.nn.functional as F
 from sklearn.cluster import KMeans
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 import warnings
-from torch.utils.data import Dataset
-from PIL import Image
-
-try:
-    from pycocotools import mask as mask_util
-    def polygons_to_bitmask(polygons, height, width):
-        rles = mask_util.frPyObjects(polygons, height, width)
-        rle = mask_util.merge(rles)
-        return mask_util.decode(rle)
-except ImportError:
-    print("Warning: pycocotools is not installed. PACO/LVIS mask handling may fail.")
-    def polygons_to_bitmask(polygons, height, width):
-        raise NotImplementedError("pycocotools is required for PACO/LVIS mask handling.")
-    class DummyMaskUtil:
-        def decode(self, segm):
-            raise NotImplementedError("pycocotools is required for PACO/LVIS mask handling.")
-    mask_util = DummyMaskUtil()
-
 warnings.filterwarnings("ignore")
 
+# Check if sam2 is available, otherwise this script won't run.
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
+import hdbscan
 
+# Import the decoupled dataset loader
+try:
+    from data.dataset import FSSDataset
+except ImportError:
+    import sys
+    sys.path.append(os.path.join(os.path.dirname(__file__), 'data'))
+    from data.dataset import FSSDataset
 
 class MPASAM2:
     """
     Mutil-Peak Autopointer for SAM2:
-    ... (MPASAM2 class definition as provided by the user)
+    - single extraction of foreground features from reference
+    - produce: dense_fg_feats (list of [N,C]), prompt_centers [B,K,C,1,1], mean target_embedding [B,1,C]
+    - similarity computed from dense_fg_feats -> multi-peak maps
+    - cal_point uses prompt_centers to select K positive points + 1 negative
     """
 
     def __init__(self, sam2_checkpoint: str, sam2_cfg: str, device: Optional[str] = None,
@@ -84,7 +75,7 @@ class MPASAM2:
 
         # align mask to feature resolution
         mask_low = F.interpolate(proc_mask.float(), size=(Hf, Wf), mode="bilinear", align_corners=False)
-        mask_low = (mask_low > 0.5).squeeze(1)  # [B, Hf, Wf]
+        mask_low = (mask_low > 0).squeeze(1)  # [B, Hf, Wf]
 
         # one-time extraction of foreground features per batch
         feats_perm = feats.permute(0, 2, 3, 1).detach()  # [B, Hf, Wf, C]
@@ -104,6 +95,8 @@ class MPASAM2:
 
         # derive prompt centers from dense features
         self.prompt_centers = self._compute_prompt_centers(self.dense_fg_feats, self.num_prompt_centers)
+        # hdbscan version
+        self.prompt_centers_hdb = self._compute_prompt_centers_hdb(self.dense_fg_feats, self.num_prompt_centers)
 
     def _compute_prompt_centers(self, dense_list: List[torch.Tensor], target_k: int) -> torch.Tensor:
         """
@@ -137,13 +130,90 @@ class MPASAM2:
         # stack to [B, K, C, 1, 1]
         prompt_tensor = torch.stack(centers_per_batch, dim=0)
         return prompt_tensor
+    
+    def _compute_prompt_centers_hdb(self, dense_list: List[torch.Tensor], target_k: int) -> torch.Tensor:
+        """
+        Build [B, K, C, 1, 1] tensor of centers using
+        HDBSCAN clustering.
+        """
+        centers_per_batch = []
+
+        for fg in dense_list:
+            N = fg.shape[0]
+            C = fg.shape[1]
+
+            # if fg is empty, give a global mean 0 and repeat K times
+            if N == 0:
+                center = fg.new_zeros((1, C))
+                center = F.normalize(center, p=2, dim=1)
+                centers = center.repeat(target_k, 1)
+            else:
+                data_np = fg.cpu().numpy().astype(np.float32)
+
+                hdbscan_success = False
+
+                #   HDBSCAN clustering
+                clusterer = hdbscan.HDBSCAN( 
+                    # divide by size for larger clusters
+                    min_cluster_size=15,
+                    # define how conservative the clustering should be
+                    min_samples=8,
+                    cluster_selection_method='eom'
+                )
+                labels = clusterer.fit_predict(data_np)
+                unique_clusters = [c for c in np.unique(labels) if c != -1]
+
+                if len(unique_clusters) > 0:
+                    # extract cluster centers
+                    cluster_centers = []
+                    for c in unique_clusters:
+                        pts = data_np[labels == c]
+                        if len(pts) > 0:
+                            cluster_centers.append(pts.mean(0, keepdims=True))
+                    if len(cluster_centers) > 0:
+                        centers = torch.tensor(np.concatenate(cluster_centers, axis=0),
+                                            dtype=fg.dtype, device=fg.device)
+                        hdbscan_success = True
+
+                #   fallback to KMeans
+                if not hdbscan_success:
+                    # print("HDBSCAN failed, fallback to KMeans")
+                    # sklearn KMeans fallback
+                    k = max(1,target_k)
+                    km = KMeans(n_clusters=k, random_state=0).fit(data_np)
+                    centers = torch.tensor(km.cluster_centers_, dtype=fg.dtype, device=fg.device)
+
+                if centers.shape[0] < target_k:
+                    repeat_num = target_k - centers.shape[0]
+                    centers = torch.cat([centers, centers[:1].repeat(repeat_num, 1)], dim=0)
+                elif centers.shape[0] > target_k:
+                    centers = centers[:target_k]
+
+            # [K,C] → normalize → [K,C,1,1]
+            centers = F.normalize(centers, p=2, dim=1)
+            centers = centers.unsqueeze(-1).unsqueeze(-1)
+
+            centers_per_batch.append(centers)
+        prompt_tensor = torch.stack(centers_per_batch, dim=0) 
+
+        return  prompt_tensor  # [B,K,C,1,1]
 
     def predict(self, test_image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        # ... (predict method as provided by the user)
+        """
+        Main inference:
+         - compute multi-peak similarity from dense_fg_feats
+         - build attn_sim from aggregated sim
+         - auto select points from prompt_centers
+         - call predictor.predict with multimask_output
+        """
         if self.dense_fg_feats is None or self.prompt_centers is None:
             raise RuntimeError("Reference not set. Call set_reference first.")
 
+        centers_kmeans = self.prompt_centers
+        centers_hdb = self.prompt_centers_hdb
+
         self.predictor.set_image(test_image)
+
         cached_features = self.predictor._features
         orig_hw = self.predictor._orig_hw[0]  # (H, W)
         test_feat = cached_features["image_embed"]  # [B, C, Hf, Wf]
@@ -181,34 +251,65 @@ class MPASAM2:
             attn_sim_list.append(attn_sim_b)
         attn_sim = torch.cat(attn_sim_list, dim=0)
 
-        # choose auto points from prompt_centers
-        auto_point_coords, auto_point_labels = self.cal_point(cached_features, self.prompt_centers, orig_hw)
+        #   HDBSCAN prompt
+        auto_coords_h, auto_labels_h = self.cal_point(cached_features, centers_hdb, orig_hw)
 
-        self.last_points = auto_point_coords.clone()
-        self.last_labels = auto_point_labels.clone()
-
-        masks, scores, logits = self.predictor.predict(
-            point_coords=auto_point_coords,
-            point_labels=auto_point_labels,
+        masks_h, scores_h, logits_h = self.predictor.predict(
+            point_coords=auto_coords_h,
+            point_labels=auto_labels_h,
             multimask_output=True,
             attn_sim=attn_sim,
             target_embedding=self.target_embedding
         )
+        best_idx_h = int(np.argmax(scores_h))
+        best_score_h = scores_h[best_idx_h]
+
+        #   KMeans-only prompt
+        auto_coords_k, auto_labels_k = self.cal_point(cached_features, centers_kmeans, orig_hw)
+
+        masks_k, scores_k, logits_k = self.predictor.predict(
+            point_coords=auto_coords_k,
+            point_labels=auto_labels_k,
+            multimask_output=True,
+            attn_sim=attn_sim,
+            target_embedding=self.target_embedding
+        )
+        best_idx_k = int(np.argmax(scores_k))
+        best_score_k = scores_k[best_idx_k]
+
+        if best_score_h >= best_score_k:
+            # using HDBSCAN
+            self.last_points = auto_coords_h.clone()
+            self.last_labels = auto_labels_h.clone()
+            masks, scores, logits = masks_h, scores_h, logits_h
+        else:
+            # using KMeans
+            self.last_points = auto_coords_k.clone()
+            self.last_labels = auto_labels_k.clone()
+            masks, scores, logits = masks_k, scores_k, logits_k
         best_idx = int(np.argmax(scores))
         best_logits = logits[best_idx][None, ...]
 
         masks_ref1, scores_ref1, logits_ref1 = self.predictor.predict(
-            point_coords=auto_point_coords,
-            point_labels=auto_point_labels,
+            point_coords=self.last_points,
+            point_labels=self.last_labels,
             mask_input=best_logits,
             multimask_output=True,
         )
+
         return masks_ref1, scores_ref1, logits_ref1
 
     def cal_point(self, test_features: Dict[str, torch.Tensor],
                   prompt_centers: torch.Tensor,
                   original_image_size: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor]:
-        # ... (cal_point method as provided by the user)
+        """
+        Select points:
+         - for each cluster center (K) pick argmax location in the test feature map
+         - add one negative point by argmin on aggregated sim (or choose far-away)
+        Returns:
+         - coords: [B, K+1, 2] float tensor (x, y)
+         - labels: [B, K+1] long tensor (1 for positives, 0 for negative)
+        """
         device = test_features["image_embed"].device
         B, C, Hf, Wf = test_features["image_embed"].shape
         orig_h, orig_w = original_image_size
@@ -265,513 +366,158 @@ class MPASAM2:
 
         return auto_point_coords, auto_point_labels
 
+    def save_vis(self,
+                    image: np.ndarray,
+                    mask: np.ndarray,
+                    output_path: str,
+                    pos_icon_path: str = "icon/click3.png",
+                    neg_icon_path: str = "icon/click4.png"):
+        if self.last_points is None or self.last_labels is None:
+            return
 
+        import matplotlib.pyplot as plt
+        from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 
-def iou_compute(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
-    """计算单个样本的 IoU"""
-    intersection = np.logical_and(pred_mask, gt_mask).sum()
-    union = np.logical_or(pred_mask, gt_mask).sum()
-    if union == 0:
-        return 1.0 if intersection == 0 else 0.0
-    return intersection / union
+        H, W = image.shape[:2]
+        alpha = 0.5
+        overlay = image.copy().astype(float)
+        overlay[mask > 0] = (
+            alpha * np.array([0, 255, 0]) + (1 - alpha) * overlay[mask > 0]
+        )
 
-class DatasetCOCO(Dataset):
-    def __init__(self, datapath, fold, split, shot, **kwargs): # 移除 transform, use_original_imgsize
-        self.split = 'val' if split in ['val', 'test'] else 'trn'
-        self.fold = fold
-        self.nfolds = 4
-        self.nclass = 80
-        self.benchmark = 'coco'
-        self.shot = shot
-        self.split_coco = split if split == 'val2014' else 'train2014'
-        self.base_path = os.path.join(datapath, 'COCO2014')
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.imshow(overlay.astype(np.uint8))
+        ax.set_xlim([0, W])
+        ax.set_ylim([H, 0])
+        ax.axis("off")
+
+        # Icons check
+        pos_icon = plt.imread(pos_icon_path) if os.path.exists(pos_icon_path) else None
+        neg_icon = plt.imread(neg_icon_path) if os.path.exists(neg_icon_path) else None
         
-        self.class_ids = self.build_class_ids()
-        self.img_metadata_classwise = self.build_img_metadata_classwise()
-        self.img_metadata = self.build_img_metadata()
+        # If no icons, just plot points
+        points = self.last_points[0]
+        labels = self.last_labels[0]
+
+        for i in range(points.shape[0]):
+            x = float(points[i, 0].item())
+            y = float(points[i, 1].item())
+            label = labels[i].item()
+            
+            if pos_icon is not None and label == 1:
+                icon_img = pos_icon
+                base_ratio = 0.01
+                icon_scale = base_ratio * (H / icon_img.shape[0])
+                icon_box = OffsetImage(icon_img, zoom=icon_scale)
+                ab = AnnotationBbox(icon_box, (x, y), frameon=False)
+                ax.add_artist(ab)
+            elif neg_icon is not None and label == 0:
+                icon_img = neg_icon
+                base_ratio = 0.01
+                icon_scale = base_ratio * (H / icon_img.shape[0])
+                icon_box = OffsetImage(icon_img, zoom=icon_scale)
+                ab = AnnotationBbox(icon_box, (x, y), frameon=False)
+                ax.add_artist(ab)
+            else:
+                color = 'r' if label==1 else 'b'
+                ax.plot(x, y, marker='*', c=color, markersize=10)
+
+        plt.savefig(output_path, dpi=150, bbox_inches="tight", pad_inches=0)
+        plt.close(fig)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MPASAM2 Inference on FSS Datasets")
+    # SAM2 args
+    parser.add_argument("--sam2_checkpoint", type=str, required=True, help="Path to SAM2 checkpoint")
+    parser.add_argument("--model_cfg", type=str, required=True, help="Path to SAM2 config")
+    parser.add_argument("--num_prompt_centers", type=int, default=3)
+
+    # Dataset arguments
+    parser.add_argument("--data_root", type=str, default="./datasets")
+    parser.add_argument("--benchmark", type=str, default="paco_part", choices=["paco_part", "pascal_part", "fss", "coco", "lvis", "pascal"])
+    parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--split", type=str, default="test", choices=["val", "test"])
+    parser.add_argument("--shot", type=int, default=1)
+    parser.add_argument("--bsz", type=int, default=4)
+    parser.add_argument("--img_size", type=int, default=448)
+    parser.add_argument("--use_original_imgsize", action="store_true")
+    
+    # Output args
+    parser.add_argument("--output_dir", type=str, default="./outputs")
+    parser.add_argument("--vis", action="store_true", help="Save visualizations")
 
-    def __len__(self):
-        return 1000 # 固定评估数量
-
-    def __getitem__(self, idx):
-        query_img, query_mask, support_imgs, support_masks, query_name, support_names, class_sample, org_qry_imsize = self.load_frame()
-
-        # 返回 PIL Image 和 NumPy Mask (bool)
-        query_mask = query_mask.numpy().astype(bool)
-        support_masks = [m.numpy().astype(bool) for m in support_masks]
-
-        batch = {'query_img': query_img,
-                 'query_mask': query_mask, # np.ndarray bool
-                 'support_imgs': support_imgs, # List[PIL Image]
-                 'support_masks': support_masks, # List[np.ndarray bool]
-                 'org_query_imsize': org_qry_imsize,
-                 'class_id': class_sample}
-
-        return batch
-
-    def build_class_ids(self):
-        nclass_trn = self.nclass // self.nfolds
-        class_ids_val = [self.fold + self.nfolds * v for v in range(nclass_trn)]
-        class_ids_trn = [x for x in range(self.nclass) if x not in class_ids_val]
-        class_ids = class_ids_trn if self.split == 'trn' else class_ids_val
-        return class_ids
-
-    def build_img_metadata_classwise(self):
-        # assumed datapath/COCO2014/splits/val/fold{self.fold}.pkl exists
-        path = os.path.join(self.base_path, 'splits', self.split, f'fold{self.fold}.pkl')
-        with open(path, 'rb') as f:
-            img_metadata_classwise = pickle.load(f)
-        return img_metadata_classwise
-
-    def build_img_metadata(self):
-        img_metadata = []
-        for k in self.img_metadata_classwise.keys():
-            img_metadata += self.img_metadata_classwise[k]
-        return sorted(list(set(img_metadata)))
-
-    def read_mask(self, name):
-        mask_path = os.path.join(self.base_path, 'annotations', name)
-        mask = torch.tensor(np.array(Image.open(mask_path[:mask_path.index('.jpg')] + '.png')))
-        return mask
-
-    def load_frame(self):
-        class_sample = np.random.choice(self.class_ids, 1, replace=False)[0]
-        query_name = np.random.choice(self.img_metadata_classwise[class_sample], 1, replace=False)[0]
-        query_img = Image.open(os.path.join(self.base_path, query_name)).convert('RGB')
-        query_mask = self.read_mask(query_name)
-
-        org_qry_imsize = query_img.size
-
-        query_mask[query_mask != class_sample + 1] = 0
-        query_mask[query_mask == class_sample + 1] = 1
-
-        support_names = []
-        while True:
-            support_name = np.random.choice(self.img_metadata_classwise[class_sample], 1, replace=False)[0]
-            if query_name != support_name: support_names.append(support_name)
-            if len(support_names) == self.shot: break
-
-        support_imgs = []
-        support_masks = []
-        for support_name in support_names:
-            support_imgs.append(Image.open(os.path.join(self.base_path, support_name)).convert('RGB'))
-            support_mask = self.read_mask(support_name)
-            support_mask[support_mask != class_sample + 1] = 0
-            support_mask[support_mask == class_sample + 1] = 1
-            support_masks.append(support_mask)
-
-        return query_img, query_mask, support_imgs, support_masks, query_name, support_names, class_sample, org_qry_imsize
-
-
-class DatasetPACOPart(Dataset):
-    def __init__(self, datapath, fold, split, shot, **kwargs): 
-        self.split = 'val' if split in ['val', 'test'] else 'trn'
-        self.fold = fold
-        self.nfolds = 4
-        self.nclass = 448
-        self.benchmark = 'paco_part'
-        self.shot = shot
-        self.img_path = os.path.join(datapath, 'PACO-Part', 'coco')
-        self.anno_path = os.path.join(datapath, 'PACO-Part', 'paco')
-        self.box_crop = kwargs.get('box_crop', False) 
-
-        self.class_ids_ori, self.cid2img, self.img2anno = self.build_img_metadata_classwise()
-        self.class_ids_c = {cid: i for i, cid in enumerate(self.class_ids_ori)}
-        self.class_ids = sorted(list(self.class_ids_c.values()))
-        self.img_metadata = self.build_img_metadata()
-
-    def __len__(self):
-        return 2500 
-
-    def __getitem__(self, idx):
-        query_img, query_mask, support_imgs, support_masks, query_name, support_names, class_sample, org_qry_imsize = self.load_frame()
-
-        # return PIL Image & NumPy Mask (bool)
-        query_mask = query_mask.numpy().astype(bool)
-        support_masks = [m.numpy().astype(bool) for m in support_masks]
-
-        batch = {'query_img': query_img,
-                 'query_mask': query_mask, # np.ndarray bool
-                 'support_imgs': support_imgs, # List[PIL Image]
-                 'support_masks': support_masks, # List[np.ndarray bool]
-                 'org_query_imsize': org_qry_imsize,
-                 'class_id': self.class_ids_c[class_sample]}
-
-        return batch
-
-    def build_img_metadata_classwise(self):
-        with open(os.path.join(self.anno_path, 'paco_part_train.pkl'), 'rb') as f:
-            train_anno = pickle.load(f)
-        with open(os.path.join(self.anno_path, 'paco_part_val.pkl'), 'rb') as f:
-            test_anno = pickle.load(f)
-
-        new_cid2img = {}
-        for cid_id in test_anno['cid2img']:
-            id_list = []
-            if cid_id not in new_cid2img: new_cid2img[cid_id] = []
-            for img in test_anno['cid2img'][cid_id]:
-                img_id = list(img.keys())[0]
-                if img_id not in id_list:
-                    id_list.append(img_id)
-                    new_cid2img[cid_id].append(img)
-        test_anno['cid2img'] = new_cid2img
-
-        train_cat_ids = list(train_anno['cid2img'].keys())
-        test_cat_ids = [i for i in list(test_anno['cid2img'].keys()) if len(test_anno['cid2img'][i]) > self.shot]
-
-        nclass_trn = self.nclass // self.nfolds
-        class_ids_val = [train_cat_ids[self.fold + self.nfolds * v] for v in range(nclass_trn)]
-        class_ids_val = [x for x in class_ids_val if x in test_cat_ids]
-        class_ids_trn = [x for x in train_cat_ids if x not in class_ids_val]
-
-        class_ids = class_ids_trn if self.split == 'trn' else class_ids_val
-        img_metadata_classwise = train_anno if self.split == 'trn' else test_anno
-        cid2img = img_metadata_classwise['cid2img']
-        img2anno = img_metadata_classwise['img2anno']
-
-        return class_ids, cid2img, img2anno
-
-    def build_img_metadata(self):
-        img_metadata = []
-        for k in self.cid2img.keys():
-            img_metadata += self.cid2img[k]
-        return img_metadata
-
-    def get_mask(self, segm, image_size):
-        if isinstance(segm, list):
-            polygons = [np.asarray(p) for p in segm]
-            mask = polygons_to_bitmask(polygons, *image_size[::-1])
-        elif isinstance(segm, dict):
-            mask = mask_util.decode(segm)
-        elif isinstance(segm, np.ndarray):
-            assert segm.ndim == 2
-            mask = segm
-        else:
-            raise NotImplementedError
-        return torch.tensor(mask)
-
-    def load_frame(self):
-        class_sample = np.random.choice(self.class_ids_ori, 1, replace=False)[0]
-        query = np.random.choice(self.cid2img[class_sample], 1, replace=False)[0]
-        query_id, query_name = list(query.keys())[0], list(query.values())[0]
-        query_name = '/'.join( query_name.split('/')[-2:])
-        query_img = Image.open(os.path.join(self.img_path, query_name)).convert('RGB')
-        org_qry_imsize = query_img.size
-        query_annos = self.img2anno[query_id]
-
-        query_obj_dict = {}
-        for anno in query_annos:
-            if anno['category_id'] == class_sample:
-                obj_id = anno['obj_ann_id']
-                if obj_id not in query_obj_dict:
-                    query_obj_dict[obj_id] = {'obj_bbox': [], 'segms': []}
-                query_obj_dict[obj_id]['obj_bbox'].append(anno['obj_bbox'])
-                query_obj_dict[obj_id]['segms'].append(self.get_mask(anno['segmentation'], org_qry_imsize)[None, ...])
-
-        sel_query_id = np.random.choice(list(query_obj_dict.keys()), 1, replace=False)[0]
-        query_obj_bbox = query_obj_dict[sel_query_id]['obj_bbox'][0]
-        query_part_masks = query_obj_dict[sel_query_id]['segms']
-        query_mask = torch.cat(query_part_masks, dim=0)
-        query_mask = query_mask.sum(0) > 0 
-
-        support_names = []
-        support_pre_masks = []
-        support_boxes = []
-        while True:
-            support = np.random.choice(self.cid2img[class_sample], 1, replace=False)[0]
-            support_id, support_name = list(support.keys())[0], list(support.values())[0]
-            support_name = '/'.join(support_name.split('/')[-2:])
-            if query_name != support_name:
-                support_names.append(support_name)
-                support_annos = self.img2anno[support_id]
-
-                support_obj_dict = {}
-                for anno in support_annos:
-                    if anno['category_id'] == class_sample:
-                        obj_id = anno['obj_ann_id']
-                        if obj_id not in support_obj_dict:
-                            support_obj_dict[obj_id] = {'obj_bbox': [], 'segms': []}
-                        support_obj_dict[obj_id]['obj_bbox'].append(anno['obj_bbox'])
-                        support_obj_dict[obj_id]['segms'].append(anno['segmentation'])
-
-                sel_support_id = np.random.choice(list(support_obj_dict.keys()), 1, replace=False)[0]
-                support_obj_bbox = support_obj_dict[sel_support_id]['obj_bbox'][0]
-                support_part_masks = support_obj_dict[sel_support_id]['segms']
-
-                support_boxes.append(support_obj_bbox)
-                support_pre_masks.append(support_part_masks)
-
-            if len(support_names) == self.shot: break
-
-        support_imgs = []
-        support_masks = []
-        for support_name, support_pre_mask in zip(support_names, support_pre_masks):
-            support_img = Image.open(os.path.join(self.img_path, support_name)).convert('RGB')
-            support_imgs.append(support_img)
-            org_sup_imsize = support_img.size
-            sup_masks = []
-            for pre_mask in support_pre_mask:
-                sup_masks.append(self.get_mask(pre_mask, org_sup_imsize)[None, ...])
-            support_mask = torch.cat(sup_masks, dim=0)
-            support_mask = support_mask.sum(0) > 0
-            support_masks.append(support_mask)
-
-        if self.box_crop:
-            query_img_np = np.asarray(query_img)
-            x, y, w, h = [int(b) for b in query_obj_bbox]
-            query_img_np = query_img_np[y:y+h, x:x+w]
-            query_img = Image.fromarray(np.uint8(query_img_np))
-            org_qry_imsize = query_img.size
-            query_mask = query_mask[y:y+h, x:x+w]
-
-            new_support_imgs = []
-            new_support_masks = []
-            for sup_img, sup_mask, sup_box in zip(support_imgs, support_masks, support_boxes):
-                sup_img_np = np.asarray(sup_img)
-                x, y, w, h = [int(b) for b in sup_box]
-                sup_img_np = sup_img_np[y:y+h, x:x+w]
-                sup_img = Image.fromarray(np.uint8(sup_img_np))
-                new_support_imgs.append(sup_img)
-                new_support_masks.append(sup_mask[y:y+h, x:x+w])
-
-            support_imgs = new_support_imgs
-            support_masks = new_support_masks
-
-        return query_img, query_mask, support_imgs, support_masks, query_name, support_names, class_sample, org_qry_imsize
-
-
-class DatasetLVIS(Dataset):
-    def __init__(self, datapath, fold, split, shot, **kwargs): # 移除 transform, use_original_imgsize
-        self.split = 'val' if split in ['val', 'test'] else 'trn'
-        self.fold = fold
-        self.nfolds = 10
-        self.benchmark = 'lvis'
-        self.shot = shot
-        self.anno_path = os.path.join(datapath, "LVIS")
-        self.base_path = os.path.join(datapath, "LVIS", 'coco')
-        
-        self.nclass, self.class_ids_ori, self.img_metadata_classwise = self.build_img_metadata_classwise()
-        self.class_ids_c = {cid: i for i, cid in enumerate(self.class_ids_ori)}
-        self.class_ids = sorted(list(self.class_ids_c.values()))
-
-        self.img_metadata = self.build_img_metadata()
-
-    def __len__(self):
-        return 2300 # 固定评估数量
-
-    def __getitem__(self, idx):
-        # 这里使用 idx 来随机选择一个类别进行采样
-        idx %= len(self.class_ids)
-
-        query_img, query_mask, support_imgs, support_masks, query_name, support_names, class_sample, org_qry_imsize = self.load_frame(idx)
-
-        # 返回 PIL Image 和 NumPy Mask (bool)
-        query_mask = query_mask.numpy().astype(bool)
-        support_masks = [m.numpy().astype(bool) for m in support_masks]
-
-        batch = {'query_img': query_img,
-                 'query_mask': query_mask, # np.ndarray bool
-                 'support_imgs': support_imgs, # List[PIL Image]
-                 'support_masks': support_masks, # List[np.ndarray bool]
-                 'org_query_imsize': org_qry_imsize,
-                 'class_id': self.class_ids_c[class_sample]}
-
-        return batch
-
-    def build_img_metadata_classwise(self):
-        # 假设 lvis_train.pkl 和 lvis_val.pkl 存在
-        with open(os.path.join(self.anno_path, 'lvis_train.pkl'), 'rb') as f:
-            train_anno = pickle.load(f)
-        with open(os.path.join(self.anno_path, 'lvis_val.pkl'), 'rb') as f:
-            val_anno = pickle.load(f)
-
-        train_cat_ids = list(train_anno.keys())
-        val_cat_ids = [i for i in list(val_anno.keys()) if len(val_anno[i]) > self.shot]
-
-        trn_nclass = len(train_cat_ids)
-        val_nclass = len(val_cat_ids)
-
-        nclass_val_spilt = val_nclass // self.nfolds
-
-        class_ids_val = [val_cat_ids[self.fold + self.nfolds * v] for v in range(nclass_val_spilt)]
-        class_ids_trn = [x for x in train_cat_ids if x not in class_ids_val]
-
-        class_ids = class_ids_trn if self.split == 'trn' else class_ids_val
-        nclass = trn_nclass if self.split == 'trn' else val_nclass
-        img_metadata_classwise = train_anno if self.split == 'trn' else val_anno
-
-        return nclass, class_ids, img_metadata_classwise
-
-    def build_img_metadata(self):
-        img_metadata = []
-        for k in self.img_metadata_classwise.keys():
-            img_metadata.extend(list(self.img_metadata_classwise[k].keys()))
-        return sorted(list(set(img_metadata)))
-
-    def get_mask(self, segm, image_size):
-        if isinstance(segm, list):
-            polygons = [np.asarray(p) for p in segm]
-            mask = polygons_to_bitmask(polygons, *image_size[::-1])
-        elif isinstance(segm, dict):
-            mask = mask_util.decode(segm)
-        elif isinstance(segm, np.ndarray):
-            assert segm.ndim == 2
-            mask = segm
-        else:
-            raise NotImplementedError
-
-        return torch.tensor(mask)
-
-    def load_frame(self, idx):
-        # 保持 load_frame 逻辑不变
-        class_sample = self.class_ids_ori[idx]
-        query_name = np.random.choice(list(self.img_metadata_classwise[class_sample].keys()), 1, replace=False)[0]
-        query_info = self.img_metadata_classwise[class_sample][query_name]
-        query_img = Image.open(os.path.join(self.base_path, query_name)).convert('RGB')
-        org_qry_imsize = query_img.size
-        query_annos = query_info['annotations']
-        segms = []
-
-        for anno in query_annos:
-            segms.append(self.get_mask(anno['segmentation'], org_qry_imsize)[None, ...].float())
-        query_mask = torch.cat(segms, dim=0)
-        query_mask = query_mask.sum(0) > 0
-
-        support_names = []
-        support_pre_masks = []
-        while True:
-            support_name = np.random.choice(list(self.img_metadata_classwise[class_sample].keys()), 1, replace=False)[0]
-            if query_name != support_name:
-                support_names.append(support_name)
-                support_info = self.img_metadata_classwise[class_sample][support_name]
-                support_annos = support_info['annotations']
-
-                support_segms = []
-                for anno in support_annos:
-                    support_segms.append(anno['segmentation'])
-                support_pre_masks.append(support_segms)
-
-            if len(support_names) == self.shot: break
-
-
-        support_imgs = []
-        support_masks = []
-        for support_name, support_pre_mask in zip(support_names, support_pre_masks):
-            support_img = Image.open(os.path.join(self.base_path, support_name)).convert('RGB')
-            support_imgs.append(support_img)
-            org_sup_imsize = support_img.size
-            sup_masks = []
-            for pre_mask in support_pre_mask:
-                sup_masks.append(self.get_mask(pre_mask, org_sup_imsize)[None, ...].float())
-            support_mask = torch.cat(sup_masks, dim=0)
-            support_mask = support_mask.sum(0) > 0
-
-            support_masks.append(support_mask)
-
-        return query_img, query_mask, support_imgs, support_masks, query_name, support_names, class_sample, org_qry_imsize
-
-
-def main_validation():
-    parser = argparse.ArgumentParser(description="MPASAM2 Few-Shot Segmentation Validation")
-    parser.add_argument("--sam2_checkpoint", type=str, required=True, help="Path to SAM2 model checkpoint.")
-    parser.add_argument("--model_cfg", type=str, required=True, help="Path to SAM2 model config file.")
-    parser.add_argument("--datapath", type=str, default="./data", help="Root directory of the few-shot datasets (COCO2014, LVIS, PACO-Part).")
-    parser.add_argument("--benchmark", type=str, choices=['coco', 'paco_part', 'lvis'], required=True, help="Dataset to evaluate.")
-    parser.add_argument("--fold", type=int, default=0, help="Dataset fold for evaluation.")
-    parser.add_argument("--nshot", type=int, default=1, choices=[1], help="Number of support shots (forced to 1 for this implementation).")
-    parser.add_argument("--num_prompt_centers", type=int, default=3, help="Number of prompt centers for MPASAM2.")
     args = parser.parse_args()
-    
-    # 强制 1-shot
-    args.nshot = 1
 
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Setup output directory
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    dataset_map = {
-        'coco': DatasetCOCO,
-        'paco_part': DatasetPACOPart,
-        'lvis': DatasetLVIS,
-    }
+    # 1. Initialize Dataset
+    FSSDataset.initialize(img_size=args.img_size, datapath=args.data_root, use_original_imgsize=args.use_original_imgsize)
+    dataloader = FSSDataset.build_dataloader(args.benchmark, args.bsz, 4, args.fold, args.split, args.shot)
 
-    if args.benchmark not in dataset_map:
-        raise ValueError(f"Unknown benchmark: {args.benchmark}")
+    # 2. Initialize Model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ptr = MPASAM2(args.sam2_checkpoint, args.model_cfg, device=device, num_prompt_centers=args.num_prompt_centers)
 
-    # 1. 初始化数据集
-    print(f"Initializing {args.benchmark} (Fold {args.fold}) dataset...")
-    DatasetClass = dataset_map[args.benchmark]
-    dataset = DatasetClass(
-        datapath=args.datapath,
-        fold=args.fold,
-        split='val',
-        shot=args.nshot,
-        # PACO-Part 默认开启 box_crop
-        box_crop=True if args.benchmark == 'paco_part' else False 
-    )
+    print(f"Starting inference on {args.benchmark} (Fold {args.fold}, Split {args.split})...")
 
-    # 2. 初始化模型
-    ptr = MPASAM2(args.sam2_checkpoint, args.model_cfg, device=DEVICE,
-                         num_prompt_centers=args.num_prompt_centers)
-    
-    # 3. 运行验证循环
-    iou_scores = []
-    
-    for idx in tqdm(range(len(dataset)), desc=f"Validating {args.benchmark}"):
-        batch = dataset[idx]
-
-        query_img_pil = batch['query_img']
-        query_mask_gt = batch['query_mask'] # np.ndarray bool
-
-        # 确保 support set 只有一个
-        ref_img_pil = batch['support_imgs'][0]
-        ref_mask_gt = batch['support_masks'][0] # np.ndarray bool
-
-        # 转换为 np.ndarray for MPASAM2 inputs
-        ref_img = np.array(ref_img_pil, dtype=np.uint8)
-        ref_mask = ref_mask_gt.astype(np.uint8) * 255 
-        query_img = np.array(query_img_pil, dtype=np.uint8)
-
-        # 3.1. 设置参考 (Set Reference)
-        # MPASAM2 内部会进行预处理和特征提取
-        ptr.set_reference(ref_img, ref_mask)
-
-        # 3.2. 预测查询 (Predict Query)
-        # 预测返回的 masks[0] 是最佳预测，大小与 query_img 相同
-        try:
-            masks, scores, logits = ptr.predict(query_img)
-        except Exception as e:
-            print(f"Error during prediction for episode {idx}: {e}")
-            continue
-
-        best_idx = int(np.argmax(scores))
-        pred_mask_bool = masks[best_idx].astype(bool)
+    for i, batch in enumerate(tqdm(dataloader)):
+        # Retrieve batch data
+        query_img = batch['query_img']      # [B, 3, H, W]
+        # query_mask = batch['query_mask']    # [B, H, W] or [B, H, W]
+        support_imgs = batch['support_imgs'] # [B, S, 3, H, W]
+        support_masks = batch['support_masks'] # [B, S, H, W]
+        query_name = batch['query_name']     # list of strings
         
-        # 3.3. 计算 IoU
-        # 预测掩码 (pred_mask_bool) 和真实掩码 (query_mask_gt) 此时应具有相同的空间分辨率
-        # 原始的 Dataset 实现中，Query Mask 是在原始分辨率或插值到统一尺寸后与 Query Image 对应的。
-        # 由于我们移除了转换，这里的 pred_mask_bool 应该与 query_mask_gt 形状相同 (原始图像大小)。
-        
-        # 确保形状匹配 (如果预测步骤未正确处理分辨率变化，可能需要额外resize)
-        if pred_mask_bool.shape != query_mask_gt.shape:
-             # 如果形状不匹配，将预测结果resize到GT尺寸
-            H, W = query_mask_gt.shape
-            pred_mask_uint8 = (pred_mask_bool * 255).astype(np.uint8)
-            pred_mask_resized = cv2.resize(pred_mask_uint8, (W, H), interpolation=cv2.INTER_NEAREST) > 127
-            iou = iou_compute(pred_mask_resized, query_mask_gt)
-        else:
-            iou = iou_compute(pred_mask_bool, query_mask_gt)
+        # Iterate over batch (normally bsz=1)
+        for b in range(query_img.shape[0]):
+            
+            # Prepare Query Image (H, W, 3) uint8 [0, 255]
+            q_img = query_img[b].permute(1, 2, 0).numpy()
+            q_img = (q_img * 255).astype(np.uint8)
 
-        iou_scores.append(iou)
+            # Prepare Support (Using 1st shot)
+            # FSSDataset images are normalized to [0,1], so *255.
+            s_img = support_imgs[b][0].permute(1, 2, 0).numpy()
+            s_img = (s_img * 255).astype(np.uint8)
+            
+            s_mask = support_masks[b][0].numpy()
+            # Ensure mask is 0-255 for consistency (MPASAM2 uses values > 0)
+            if s_mask.max() <= 1.0:
+                s_mask = (s_mask * 255).astype(np.uint8)
+            else:
+                s_mask = s_mask.astype(np.uint8)
 
-    # 4. 结果汇报
-    mean_iou = np.mean(iou_scores) * 100
-    
-    print("\n" + "="*50)
-    print(f"Few-Shot Segmentation Results on {args.benchmark} (Fold {args.fold}):")
-    print(f"Total Episodes: {len(iou_scores)}")
-    print(f"Mean IoU (mIoU): {mean_iou:.2f}%")
-    print("="*50)
+            # Inference
+            try:
+                ptr.set_reference(s_img, s_mask)
+                masks, scores, logits = ptr.predict(q_img)
+                
+                best_idx = int(np.argmax(scores))
+                final_mask = masks[best_idx]
+                
+                # Naming for output
+                q_n = query_name[b]
+                safe_name = q_n.replace('/', '_').replace('\\', '_').replace('.jpg', '').replace('.png', '')
+                if not safe_name: 
+                    safe_name = f"{i}_{b}"
+                
+                # Save Visualization
+                if args.vis:
+                    vis_path = os.path.join(args.output_dir, f"{safe_name}_vis.jpg")
+                    ptr.save_vis(q_img, final_mask, vis_path)
+                
+                # Save Mask
+                mask_path = os.path.join(args.output_dir, f"{safe_name}.png")
+                final_mask_uint8 = (final_mask > 0).astype(np.uint8) * 255
+                cv2.imwrite(mask_path, final_mask_uint8)
 
+            except Exception as e:
+                print(f"Failed on {query_name[b]}: {e}")
+                continue
+                
+    print("Inference finished.")
 
 if __name__ == "__main__":
-    # 使用新的验证函数
-    main_validation()
+    main()
