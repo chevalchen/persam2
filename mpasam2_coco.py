@@ -15,7 +15,6 @@ warnings.filterwarnings("ignore")
 # Check if sam2 is available, otherwise this script won't run.
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
-import hdbscan
 
 # Import the decoupled dataset loader
 try:
@@ -40,7 +39,6 @@ class MPASAM2:
         self.predictor = SAM2ImagePredictor(self.model)
         self.device = device or self.model.device
         self.model.eval()
-
         # Derived from reference:
         self.dense_fg_feats: Optional[List[torch.Tensor]] = None  # list[B] of [N, C]
         self.prompt_centers: Optional[torch.Tensor] = None        # [B, K, C, 1, 1]
@@ -95,8 +93,6 @@ class MPASAM2:
 
         # derive prompt centers from dense features
         self.prompt_centers = self._compute_prompt_centers(self.dense_fg_feats, self.num_prompt_centers)
-        # hdbscan version
-        self.prompt_centers_hdb = self._compute_prompt_centers_hdb(self.dense_fg_feats, self.num_prompt_centers)
 
     def _compute_prompt_centers(self, dense_list: List[torch.Tensor], target_k: int) -> torch.Tensor:
         """
@@ -117,7 +113,7 @@ class MPASAM2:
             else:
                 # run KMeans on CPU
                 k = max(1, min(target_k, N))
-                # sklearn requires numpy float64 or float32. Use float32
+
                 km = KMeans(n_clusters=k, random_state=0).fit(fg.cpu().numpy())
                 centers = torch.tensor(km.cluster_centers_, dtype=fg.dtype, device=fg.device)
                 if k < target_k:
@@ -131,78 +127,11 @@ class MPASAM2:
         prompt_tensor = torch.stack(centers_per_batch, dim=0)
         return prompt_tensor
     
-    def _compute_prompt_centers_hdb(self, dense_list: List[torch.Tensor], target_k: int) -> torch.Tensor:
-        """
-        Build [B, K, C, 1, 1] tensor of centers using
-        HDBSCAN clustering.
-        """
-        centers_per_batch = []
-
-        for fg in dense_list:
-            N = fg.shape[0]
-            C = fg.shape[1]
-
-            # if fg is empty, give a global mean 0 and repeat K times
-            if N == 0:
-                center = fg.new_zeros((1, C))
-                center = F.normalize(center, p=2, dim=1)
-                centers = center.repeat(target_k, 1)
-            else:
-                data_np = fg.cpu().numpy().astype(np.float32)
-
-                hdbscan_success = False
-
-                #   HDBSCAN clustering
-                clusterer = hdbscan.HDBSCAN( 
-                    # divide by size for larger clusters
-                    min_cluster_size=15,
-                    # define how conservative the clustering should be
-                    min_samples=8,
-                    cluster_selection_method='eom'
-                )
-                labels = clusterer.fit_predict(data_np)
-                unique_clusters = [c for c in np.unique(labels) if c != -1]
-
-                if len(unique_clusters) > 0:
-                    # extract cluster centers
-                    cluster_centers = []
-                    for c in unique_clusters:
-                        pts = data_np[labels == c]
-                        if len(pts) > 0:
-                            cluster_centers.append(pts.mean(0, keepdims=True))
-                    if len(cluster_centers) > 0:
-                        centers = torch.tensor(np.concatenate(cluster_centers, axis=0),
-                                            dtype=fg.dtype, device=fg.device)
-                        hdbscan_success = True
-
-                #   fallback to KMeans
-                if not hdbscan_success:
-                    # print("HDBSCAN failed, fallback to KMeans")
-                    # sklearn KMeans fallback
-                    k = max(1,target_k)
-                    km = KMeans(n_clusters=k, random_state=0).fit(data_np)
-                    centers = torch.tensor(km.cluster_centers_, dtype=fg.dtype, device=fg.device)
-
-                if centers.shape[0] < target_k:
-                    repeat_num = target_k - centers.shape[0]
-                    centers = torch.cat([centers, centers[:1].repeat(repeat_num, 1)], dim=0)
-                elif centers.shape[0] > target_k:
-                    centers = centers[:target_k]
-
-            # [K,C] → normalize → [K,C,1,1]
-            centers = F.normalize(centers, p=2, dim=1)
-            centers = centers.unsqueeze(-1).unsqueeze(-1)
-
-            centers_per_batch.append(centers)
-        prompt_tensor = torch.stack(centers_per_batch, dim=0) 
-
-        return  prompt_tensor  # [B,K,C,1,1]
 
     def predict(self, test_image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Main inference:
          - compute multi-peak similarity from dense_fg_feats
-         - build attn_sim from aggregated sim
          - auto select points from prompt_centers
          - call predictor.predict with multimask_output
         """
@@ -210,89 +139,27 @@ class MPASAM2:
             raise RuntimeError("Reference not set. Call set_reference first.")
 
         centers_kmeans = self.prompt_centers
-        centers_hdb = self.prompt_centers_hdb
 
         self.predictor.set_image(test_image)
 
         cached_features = self.predictor._features
         orig_hw = self.predictor._orig_hw[0]  # (H, W)
-        test_feat = cached_features["image_embed"]  # [B, C, Hf, Wf]
-        B, C, Hf, Wf = test_feat.shape
 
-        # normalize test features
-        test_norm = F.normalize(test_feat, p=2, dim=1)  # [B, C, Hf, Wf]
-        test_flat = test_norm.view(B, C, Hf * Wf)       # [B, C, Hf*Wf]
+        topk_points, topk_labels = self.cal_point(cached_features, centers_kmeans, orig_hw)
 
-        # similarity aggregated from dense reference pixels (mean over ref pixels)
-        sim_maps = []
-        for b in range(B):
-            ref = self.dense_fg_feats[b]                 # [N, C]
-            # [N, C] @ [C, Hf*Wf] -> [N, Hf*Wf]
-            sim_dense = torch.matmul(ref, test_flat[b])  # [N, Hf*Wf]
-            sim_agg = sim_dense.mean(0)                  # [Hf*Wf]
-            sim_agg = sim_agg.view(1, 1, Hf, Wf)         # [1,1,Hf,Wf]
-            sim_maps.append(sim_agg)
-        sim = torch.cat(sim_maps, dim=0)  # [B,1,Hf,Wf]
-
-        # postprocess to original size
-        sim_up = self.predictor._transforms.postprocess_masks(sim, orig_hw=orig_hw)  # [B,1,H,W]
-        sim_orig = sim_up.squeeze(1)  # [B, H, W]
-
-        # attn_sim for predictor guidance (64x64 flattened)
-        attn_sim_list = []
-        for b in range(B):
-            sim_b = sim_orig[b]
-            sim_std = torch.std(sim_b)
-            if sim_std == 0:
-                sim_std = 1.0
-            sim_b = (sim_b - sim_b.mean()) / sim_std
-            sim_b_64 = F.interpolate(sim_b.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="bilinear")
-            attn_sim_b = sim_b_64.sigmoid_().unsqueeze(0).flatten(3)
-            attn_sim_list.append(attn_sim_b)
-        attn_sim = torch.cat(attn_sim_list, dim=0)
-
-        #   HDBSCAN prompt
-        auto_coords_h, auto_labels_h = self.cal_point(cached_features, centers_hdb, orig_hw)
-
-        masks_h, scores_h, logits_h = self.predictor.predict(
-            point_coords=auto_coords_h,
-            point_labels=auto_labels_h,
-            multimask_output=True,
-            attn_sim=attn_sim,
-            target_embedding=self.target_embedding
+        masks, scores, logits = self.predictor.predict(
+            point_coords=topk_points,
+            point_labels=topk_labels,
+            multimask_output=True
         )
-        best_idx_h = int(np.argmax(scores_h))
-        best_score_h = scores_h[best_idx_h]
-
-        #   KMeans-only prompt
-        auto_coords_k, auto_labels_k = self.cal_point(cached_features, centers_kmeans, orig_hw)
-
-        masks_k, scores_k, logits_k = self.predictor.predict(
-            point_coords=auto_coords_k,
-            point_labels=auto_labels_k,
-            multimask_output=True,
-            attn_sim=attn_sim,
-            target_embedding=self.target_embedding
-        )
-        best_idx_k = int(np.argmax(scores_k))
-        best_score_k = scores_k[best_idx_k]
-
-        if best_score_h >= best_score_k:
-            # using HDBSCAN
-            self.last_points = auto_coords_h.clone()
-            self.last_labels = auto_labels_h.clone()
-            masks, scores, logits = masks_h, scores_h, logits_h
-        else:
-            # using KMeans
-            self.last_points = auto_coords_k.clone()
-            self.last_labels = auto_labels_k.clone()
-            masks, scores, logits = masks_k, scores_k, logits_k
+        self.last_points = topk_points.clone()
+        self.last_labels = topk_labels.clone()
         best_idx = int(np.argmax(scores))
         best_logits = logits[best_idx][None, ...]
 
         masks_ref1, scores_ref1, logits_ref1 = self.predictor.predict(
-            point_coords=self.last_points,
-            point_labels=self.last_labels,
+            point_coords=topk_points,
+            point_labels=topk_labels,
             mask_input=best_logits,
             multimask_output=True,
         )
@@ -315,7 +182,6 @@ class MPASAM2:
         orig_h, orig_w = original_image_size
 
         test_feat = F.normalize(test_features["image_embed"], p=2, dim=1)  # [B, C, Hf, Wf]
-        # compute per-cluster similarity maps at feature resolution
         prompt = prompt_centers.to(device)  # [B, K, C, 1, 1]
         K = prompt.shape[1]
 
@@ -326,10 +192,8 @@ class MPASAM2:
             sim_map_list.append(sim.unsqueeze(1))
         sim_map = torch.cat(sim_map_list, dim=1)  # [B, K, Hf, Wf]
 
-        # aggregated map for negative selection
         sim_agg = sim_map.mean(dim=1)  # [B, Hf, Wf]
 
-        # upsample to image resolution
         sim_up_multi = F.interpolate(sim_map, size=(orig_h, orig_w), mode="bilinear", align_corners=False)  # [B, K, H, W]
         sim_up_agg = F.interpolate(sim_agg.unsqueeze(1), size=(orig_h, orig_w), mode="bilinear", align_corners=False).squeeze(1)  # [B, H, W]
 
@@ -348,7 +212,6 @@ class MPASAM2:
                 pos_y = float(max(0, min(h - 1, pos_y)))
                 coords.append([pos_x, pos_y])
                 labels.append(1)
-            # negative: global min on aggregated map
             flat_g = sim_up_agg[b].flatten()
             neg_idx = torch.argmin(flat_g)
             ny = int(neg_idx // w)
@@ -360,11 +223,11 @@ class MPASAM2:
 
             coords_batch.append(torch.tensor(coords, device=device, dtype=torch.float32).unsqueeze(0))  # [1, K+1, 2]
             labels_batch.append(torch.tensor(labels, device=device, dtype=torch.long).unsqueeze(0))     # [1, K+1]
+        # 点坐标张量和点的属性标签张量
+        point_coords = torch.cat(coords_batch, dim=0)  # [B, K+1, 2]
+        point_labels = torch.cat(labels_batch, dim=0)  # [B, K+1]
 
-        auto_point_coords = torch.cat(coords_batch, dim=0)  # [B, K+1, 2]
-        auto_point_labels = torch.cat(labels_batch, dim=0)  # [B, K+1]
-
-        return auto_point_coords, auto_point_labels
+        return point_coords, point_labels
 
     def save_vis(self,
                     image: np.ndarray,
@@ -391,11 +254,9 @@ class MPASAM2:
         ax.set_ylim([H, 0])
         ax.axis("off")
 
-        # Icons check
         pos_icon = plt.imread(pos_icon_path) if os.path.exists(pos_icon_path) else None
         neg_icon = plt.imread(neg_icon_path) if os.path.exists(neg_icon_path) else None
         
-        # If no icons, just plot points
         points = self.last_points[0]
         labels = self.last_labels[0]
 
@@ -428,35 +289,29 @@ class MPASAM2:
 
 def main():
     parser = argparse.ArgumentParser(description="MPASAM2 Inference on FSS Datasets")
-    # SAM2 args
     parser.add_argument("--sam2_checkpoint", type=str, required=True, help="Path to SAM2 checkpoint")
     parser.add_argument("--model_cfg", type=str, required=True, help="Path to SAM2 config")
     parser.add_argument("--num_prompt_centers", type=int, default=3)
-
-    # Dataset arguments
     parser.add_argument("--data_root", type=str, default="./datasets")
     parser.add_argument("--benchmark", type=str, default="paco_part", choices=["paco_part", "pascal_part", "fss", "coco", "lvis", "pascal"])
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--split", type=str, default="test", choices=["val", "test"])
     parser.add_argument("--shot", type=int, default=1)
-    parser.add_argument("--bsz", type=int, default=4)
+    parser.add_argument("--bsz", type=int, default=16)
     parser.add_argument("--img_size", type=int, default=448)
     parser.add_argument("--use_original_imgsize", action="store_true")
-    
-    # Output args
     parser.add_argument("--output_dir", type=str, default="./outputs")
     parser.add_argument("--vis", action="store_true", help="Save visualizations")
 
     args = parser.parse_args()
 
-    # Setup output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 1. Initialize Dataset
+    # Initialize Dataset
     FSSDataset.initialize(img_size=args.img_size, datapath=args.data_root, use_original_imgsize=args.use_original_imgsize)
     dataloader = FSSDataset.build_dataloader(args.benchmark, args.bsz, 4, args.fold, args.split, args.shot)
 
-    # 2. Initialize Model
+    # Initialize Model
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ptr = MPASAM2(args.sam2_checkpoint, args.model_cfg, device=device, num_prompt_centers=args.num_prompt_centers)
 
@@ -470,20 +325,15 @@ def main():
         support_masks = batch['support_masks'] # [B, S, H, W]
         query_name = batch['query_name']     # list of strings
         
-        # Iterate over batch (normally bsz=1)
         for b in range(query_img.shape[0]):
             
-            # Prepare Query Image (H, W, 3) uint8 [0, 255]
             q_img = query_img[b].permute(1, 2, 0).numpy()
             q_img = (q_img * 255).astype(np.uint8)
 
-            # Prepare Support (Using 1st shot)
-            # FSSDataset images are normalized to [0,1], so *255.
             s_img = support_imgs[b][0].permute(1, 2, 0).numpy()
             s_img = (s_img * 255).astype(np.uint8)
             
             s_mask = support_masks[b][0].numpy()
-            # Ensure mask is 0-255 for consistency (MPASAM2 uses values > 0)
             if s_mask.max() <= 1.0:
                 s_mask = (s_mask * 255).astype(np.uint8)
             else:
@@ -497,7 +347,6 @@ def main():
                 best_idx = int(np.argmax(scores))
                 final_mask = masks[best_idx]
                 
-                # Naming for output
                 q_n = query_name[b]
                 safe_name = q_n.replace('/', '_').replace('\\', '_').replace('.jpg', '').replace('.png', '')
                 if not safe_name: 

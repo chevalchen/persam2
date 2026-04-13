@@ -19,7 +19,7 @@ def evaluate():
     parser = argparse.ArgumentParser(description="Evaluation Script for MPASAM2")
     parser.add_argument("--predict_dir", type=str, required=True, help="推理结果保存的路径")
     parser.add_argument("--benchmark", type=str, default="paco_part", choices=["paco_part", "pascal_part", "fss", "coco", "lvis", "pascal"])
-    parser.add_argument("--data_root", type=str, default="./datasets")
+    parser.add_argument("--data_root", type=str, default="../datasets")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--img_size", type=int, default=448)
